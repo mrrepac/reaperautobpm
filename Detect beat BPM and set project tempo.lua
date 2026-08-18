@@ -1,8 +1,8 @@
--- @description Detect beat BPM with Essentia and set project tempo
--- @version 1.3.0
+-- @description Detect beat BPM with TempoCNN and set project tempo
+-- @version 2.0.0
 -- @author reaperplug
 -- @about
---   Uses Essentia RhythmExtractor2013 / BeatTrackerMultiFeature.
+--   Uses TempoCNN (deeptemp_k16).
 --   Select an audio item (or park the edit cursor on one), then run the script.
 --   The detected BPM is shown for confirmation before the project tempo changes.
 
@@ -11,18 +11,19 @@ local ANALYSIS_TIMEOUT_MS = 180000
 local MIN_ACCEPTED_BPM = 20
 local MAX_ACCEPTED_BPM = 960
 
-local ENGINE_FILENAME = "essentia_streaming_rhythmextractor_multifeature.exe"
-local LAUNCHER_FILENAME = "launch_essentia.ps1"
-local RUNNER_FILENAME = "run_essentia.ps1"
+local ENGINE_FILENAME = "tempocnn_engine.exe"
+local LAUNCHER_FILENAME = "launch_engine.ps1"
+local RUNNER_FILENAME = "run_engine.ps1"
+local MODEL_FILENAME = "deeptemp_k16.onnx"
 local RESULT_PREFIX = "bpm_result_"
 
-local EXT_SECTION = "reaperplug_essentia_bpm"
+local EXT_SECTION = "reaperplug_engine_bpm"
 local EXT_RUNNING_KEY = "analysis_started_at"
 
 local SEPARATOR = package.config:sub(1, 1)
 
 local function fail(message)
-  reaper.MB(message, "Essentia BPM Detector", 0)
+  reaper.MB(message, "TempoCNN BPM Detector", 0)
   return nil
 end
 
@@ -169,8 +170,9 @@ local function engine_paths()
     engine = engine_directory .. SEPARATOR .. ENGINE_FILENAME,
     runner = engine_directory .. SEPARATOR .. RUNNER_FILENAME,
     launcher = engine_directory .. SEPARATOR .. LAUNCHER_FILENAME,
+    model = engine_directory .. SEPARATOR .. MODEL_FILENAME,
   }
-  for _, key in ipairs({ "engine", "runner", "launcher" }) do
+  for _, key in ipairs({ "engine", "runner", "launcher", "model" }) do
     if not reaper.file_exists(paths[key]) then
       return nil, "Не найден файл движка:\n" .. paths[key]
     end
@@ -197,21 +199,21 @@ local function remove_stale_results(engine_directory)
   end
 end
 
-local function parse_essentia_output(output)
-  local engine_exit = output and tonumber(output:match("__ESSENTIA_EXIT__=(%-?%d+)")) or nil
+local function parse_engine_output(output)
+  local engine_exit = output and tonumber(output:match("__ENGINE_EXIT__=(%-?%d+)")) or nil
   if engine_exit == nil then
-    return nil, "Результат Essentia повреждён или не завершён."
+    return nil, "Результат анализа повреждён или не завершён."
   end
   if engine_exit ~= 0 then
-    return nil, "Essentia завершилась с кодом " .. tostring(engine_exit) .. ":\n" .. output
+    return nil, "Движок завершился с кодом " .. tostring(engine_exit) .. ":\n" .. output
   end
   local bpm = tonumber(output:match("bpm:%s*([%d%.]+)"))
   if not bpm or bpm <= 0 then
-    return nil, "Essentia не смогла определить BPM:\n" .. (output or "")
+    return nil, "Движок не смог определить BPM:\n" .. (output or "")
   end
   return {
     bpm = bpm,
-    confidence = tonumber(output:match("ticks detection confidence:%s*([%d%.%-]+)")) or 0,
+    confidence = tonumber(output:match("confidence:%s*([%d%.%-]+)")) or 0,
   }
 end
 
@@ -245,7 +247,7 @@ local function analysis_in_progress()
   return true
 end
 
-local function async_essentia(audio_path, on_complete)
+local function async_engine(audio_path, on_complete)
   local paths, paths_error = engine_paths()
   if not paths then
     fail(paths_error)
@@ -277,7 +279,7 @@ local function async_essentia(audio_path, on_complete)
   local execute_result, execute_reason, execute_code = os.execute(launch_command)
   local launch_ok = execute_result == true or execute_result == 0
   if not launch_ok then
-    fail("Не удалось запустить Essentia в фоне. Код: "
+    fail("Не удалось запустить движок в фоне. Код: "
       .. tostring(execute_code or execute_result)
       .. "; причина: " .. tostring(execute_reason or "неизвестна"))
     return false
@@ -291,13 +293,13 @@ local function async_essentia(audio_path, on_complete)
       local output = read_text_file(result_path)
       os.remove(result_path)
       set_analysis_running(false)
-      on_complete(parse_essentia_output(output))
+      on_complete(parse_engine_output(output))
       return
     end
 
     if (reaper.time_precise() - started) * 1000 > ANALYSIS_TIMEOUT_MS then
       set_analysis_running(false)
-      fail("Essentia не завершила анализ за отведённое время.")
+      fail("Движок не завершил анализ за отведённое время.")
       return
     end
 
@@ -322,7 +324,7 @@ local function apply_result(project, item, bpm)
   -- Project tempo must change without stretching the reference beat.
   reaper.SetMediaItemInfo_Value(item, "C_BEATATTACHMODE", 0)
   reaper.SetCurrentBPM(project, bpm, false)
-  reaper.Undo_EndBlock("Detect beat BPM with Essentia and set project tempo", -1)
+  reaper.Undo_EndBlock("Detect beat BPM with TempoCNN and set project tempo", -1)
   reaper.UpdateArrange()
   return bpm
 end
@@ -397,11 +399,11 @@ local function main()
 
   local audio_path = reaper.GetMediaSourceFileName(source)
   if not audio_path or audio_path == "" or not reaper.file_exists(audio_path) then
-    fail("Essentia может анализировать только audio source, сохранённый как файл.")
+    fail("Движок может анализировать только audio source, сохранённый как файл.")
     return
   end
 
-  async_essentia(audio_path, function(result, analysis_error)
+  async_engine(audio_path, function(result, analysis_error)
     if not result then
       fail(analysis_error)
       return
