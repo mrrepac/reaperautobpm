@@ -1,5 +1,5 @@
 -- @description Detect beat BPM with TempoCNN and set project tempo
--- @version 2.0.1
+-- @version 2.1.0
 -- @author reaperplug
 -- @about
 --   Uses TempoCNN (deeptemp_k16).
@@ -30,6 +30,101 @@ local SEPARATOR = package.config:sub(1, 1)
 local function fail(message)
   reaper.MB(message, "TempoCNN BPM Detector", 0)
   return nil
+end
+
+-- Progress window -------------------------------------------------------------
+
+local PROGRESS_WIDTH = 460
+local PROGRESS_HEIGHT = 128
+
+local progress = { visible = false, caption = "" }
+
+local function utf8_tail(text, max_bytes)
+  if #text <= max_bytes then return text end
+  local start = #text - max_bytes + 1
+  -- Never start mid-character: continuation bytes are 0x80..0xBF.
+  while start <= #text do
+    local byte = text:byte(start)
+    if byte < 0x80 or byte >= 0xC0 then break end
+    start = start + 1
+  end
+  return "…" .. text:sub(start)
+end
+
+function progress.show(caption)
+  -- Four returns, not five: the viewport rect is written back into the first
+  -- four arguments and the function itself returns nothing.
+  local left, top, right, bottom = reaper.my_getViewport(
+    0, 0, 0, 0, 0, 0, 0, 0, true)
+  local x, y = 120, 120
+  if left and right > left and bottom > top then
+    x = math.floor((left + right - PROGRESS_WIDTH) / 2)
+    y = math.floor((top + bottom - PROGRESS_HEIGHT) / 2)
+  end
+
+  progress.caption = utf8_tail(caption, 52)
+  gfx.init("Detect BPM", PROGRESS_WIDTH, PROGRESS_HEIGHT, 0, x, y)
+  gfx.setfont(1, "Segoe UI", 17)
+  gfx.setfont(2, "Segoe UI", 13)
+  progress.visible = true
+end
+
+function progress.close()
+  if not progress.visible then return end
+  gfx.quit()
+  progress.visible = false
+end
+
+-- Returns false once the user asks to stop, by Escape or by closing the window.
+function progress.update(elapsed, stage)
+  if not progress.visible then return true end
+
+  local char = gfx.getchar()
+  if char < 0 or char == 27 then return false end
+
+  gfx.set(0.11, 0.11, 0.13, 1)
+  gfx.rect(0, 0, gfx.w, gfx.h, 1)
+
+  gfx.setfont(1)
+  gfx.set(0.93, 0.93, 0.95, 1)
+  gfx.x, gfx.y = 20, 22
+  gfx.drawstr(progress.caption)
+
+  -- The engine reports no intermediate progress, so the bar sweeps instead of
+  -- filling: an honest "still working", not a fabricated percentage.
+  local bar_x, bar_y = 20, 66
+  local bar_w, bar_h = gfx.w - 40, 8
+  gfx.set(0.20, 0.20, 0.23, 1)
+  gfx.rect(bar_x, bar_y, bar_w, bar_h, 1)
+
+  local knob_w = bar_w * 0.28
+  local span = bar_w + knob_w
+  local offset = (elapsed * 0.6) % 1.0 * span - knob_w
+  local from = math.max(bar_x, bar_x + offset)
+  local to = math.min(bar_x + bar_w, bar_x + offset + knob_w)
+  if to > from then
+    gfx.set(0.36, 0.62, 0.93, 1)
+    gfx.rect(from, bar_y, to - from, bar_h, 1)
+  end
+
+  gfx.setfont(2)
+  gfx.set(0.60, 0.60, 0.65, 1)
+  gfx.x, gfx.y = 20, 92
+  gfx.drawstr(string.format("%s · %d с · Esc — отмена", stage, math.floor(elapsed)))
+
+  gfx.update()
+  return true
+end
+
+-- Toolbar ---------------------------------------------------------------------
+
+local toolbar = {}
+
+function toolbar.set(state)
+  local _, _, section, command = reaper.get_action_context()
+  if not section or not command or command <= 0 then return end
+  reaper.SetToggleCommandState(section, command, state)
+  reaper.RefreshToolbar2(section, command)
 end
 
 -- Whole numbers only: a fractional project tempo is not what this action is for.
@@ -261,13 +356,36 @@ end
 
 -- Analysis state --------------------------------------------------------------
 
+-- Only the run that claimed the flag may clear it, so a second invocation
+-- bouncing off "analysis already running" cannot release the first one's claim.
+local owned = { analysis = false, job = nil, result = nil }
+
 local function set_analysis_running(running)
   if running then
+    owned.analysis = true
     reaper.SetExtState(EXT_SECTION, EXT_RUNNING_KEY, tostring(os.time()), false)
   else
+    owned.analysis = false
     reaper.DeleteExtState(EXT_SECTION, EXT_RUNNING_KEY, false)
   end
 end
+
+-- Escape tears deferred scripts down without unwinding, and closing REAPER
+-- mid-analysis does the same. This is the only cleanup that always runs.
+reaper.atexit(function()
+  progress.close()
+  -- Everything below belongs to a run this instance owns. A second invocation
+  -- that bounced off the busy check must not clear the first one's toolbar
+  -- light or delete its files.
+  if not owned.analysis then return end
+  toolbar.set(0)
+  if owned.job then os.remove(owned.job) end
+  if owned.result then
+    os.remove(owned.result)
+    os.remove(owned.result .. ".running")
+  end
+  reaper.DeleteExtState(EXT_SECTION, EXT_RUNNING_KEY, false)
+end)
 
 local function analysis_in_progress()
   local started = tonumber(reaper.GetExtState(EXT_SECTION, EXT_RUNNING_KEY))
@@ -330,14 +448,21 @@ local function async_engine(audio_path, on_complete)
   end
 
   set_analysis_running(true)
+  owned.job, owned.result = job_path, result_path
   local started = reaper.time_precise()
   -- The runner touches this the moment it starts, which turns a launch that
   -- silently went nowhere into a fast error instead of a three-minute wait.
   local heartbeat_path = result_path .. ".running"
+  local running = false
+
+  toolbar.set(1)
+  progress.show(audio_path:match("[^/\\]+$") or "Анализ BPM")
 
   local function finish()
     os.remove(job_path)
     set_analysis_running(false)
+    progress.close()
+    toolbar.set(0)
   end
 
   local function poll()
@@ -349,9 +474,21 @@ local function async_engine(audio_path, on_complete)
       return
     end
 
-    local elapsed_ms = (reaper.time_precise() - started) * 1000
+    local elapsed = reaper.time_precise() - started
+    -- Checked until it appears, then left alone: the runner deletes it by
+    -- renaming it onto the result path.
+    if not running and reaper.file_exists(heartbeat_path) then running = true end
 
-    if elapsed_ms > LAUNCH_CONFIRM_MS and not reaper.file_exists(heartbeat_path) then
+    if not progress.update(elapsed, running and "Анализ" or "Запуск движка") then
+      -- Cancelled by the user. The engine process is left to finish and die on
+      -- its own; its leftovers are swept up by the next run.
+      finish()
+      return
+    end
+
+    local elapsed_ms = elapsed * 1000
+
+    if elapsed_ms > LAUNCH_CONFIRM_MS and not running then
       finish()
       fail("Движок не запустился. Проверьте, что PowerShell не заблокирован политикой"
         .. " безопасности, и что файлы в папке engine на месте.")
