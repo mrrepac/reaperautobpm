@@ -1,6 +1,6 @@
-# Essentia BPM Detector для REAPER
+# TempoCNN BPM Detector для REAPER
 
-ReaScript определяет темп аудиофайла через **Essentia RhythmExtractor2013 / BeatTrackerMultiFeature**,
+ReaScript определяет темп аудиофайла через **TempoCNN (deeptemp_k16)**,
 показывает найденный BPM для подтверждения и выставляет его как темп проекта. Темп всегда целый.
 Метрический уровень не подгоняется: сколько услышал движок, столько и предлагается.
 Самописный Lua-анализатор не используется.
@@ -10,11 +10,14 @@ ReaScript определяет темп аудиофайла через **Essent
 ```text
 Detect beat BPM and set project tempo.lua
 engine/
-  essentia_streaming_rhythmextractor_multifeature.exe
-  launch_essentia.ps1
-  run_essentia.ps1
+  tempocnn_engine.exe
+  deeptemp_k16.onnx
+  launch_engine.ps1
+  run_engine.ps1
+  src/tempocnn_engine.py    исходник движка (для воспроизводимой сборки)
 docs/
   superpowers/specs/          дизайн-документы
+  superpowers/plans/          планы реализации
 ```
 
 Lua-файл и папка `engine/` обязательны и должны сохранять эту структуру.
@@ -31,9 +34,9 @@ Lua-файл и папка `engine/` обязательны и должны со
 ## Использование
 
 1. Добавьте бит в проект.
-2. Запустите **Detect beat BPM with Essentia and set project tempo**.
+2. Запустите **Detect beat BPM with TempoCNN and set project tempo**.
 3. Скрипт сначала проверит BPM в метаданных и в имени файла. Если точной подсказки нет,
-   он запустит локальный Essentia engine в фоновом процессе.
+   он запустит локальный TempoCNN engine в фоновом процессе.
 4. По окончании появится окно с найденным BPM. Enter применяет его, Cancel отменяет всё.
 
 Во время анализа интерфейс REAPER остаётся доступным. Короткий launcher запускается через явный
@@ -91,11 +94,24 @@ Item никогда не двигается — меняется только т
 
 ## Движок
 
-Используется официальный статический Windows extractor Essentia 2.1 beta 5. Он работает локально
-и не отправляет аудио в интернет. SHA-256 загруженного файла:
+Используется TempoCNN (`deeptemp_k16`, Hendrik Schreiber) — свёрточная сеть,
+предсказывающая темп напрямую по мел-спектрограмме. Веса сконвертированы из
+оригинального Keras-формата в ONNX и исполняются через `onnxruntime`, без
+зависимости от TensorFlow в собранном движке. Работает локально, аудио никуда
+не отправляется.
+
+SHA-256 `tempocnn_engine.exe`:
 
 ```text
-5D0B892310F0111B6773603013AC2427F92AE8CC147E929A70FC30E194DAEB62
+2D4EB0498903C3C4060A7169490BCBC6067E83A6229CF2984F6ABC426288CF32
 ```
 
-Сведения о происхождении и лицензии находятся в `THIRD_PARTY_NOTICES.md`.
+SHA-256 `deeptemp_k16.onnx`:
+
+```text
+4D41FCC576C0B510DFB807A5A19BC04A1D77EDF6AF9341A9F7982B06F1B921C5
+```
+
+Как воспроизвести сборку — `dev/model_conversion/README.md`.
+
+Сведения о происхождении и лицензии — `THIRD_PARTY_NOTICES.md`.
