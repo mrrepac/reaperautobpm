@@ -95,6 +95,15 @@ def estimate(audio_path: str) -> tuple[float, float]:
 
 
 def main() -> int:
+    # Paths echoed back in error messages are whatever the filesystem holds, so
+    # the default locale encoding is not enough to print them. PYTHONIOENCODING
+    # cannot do this for us: the frozen build runs an isolated interpreter
+    # config that ignores the PYTHON* environment variables.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
     if len(sys.argv) != 2:
         print("usage: tempocnn_engine.exe <audio_path>", file=sys.stderr)
         return 2

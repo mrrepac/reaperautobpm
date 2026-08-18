@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$RunnerPath,
     [Parameter(Mandatory = $true)][string]$EnginePath,
-    [Parameter(Mandatory = $true)][string]$AudioPath,
+    [Parameter(Mandatory = $true)][string]$JobPath,
     [Parameter(Mandatory = $true)][string]$ResultPath
 )
 
@@ -17,7 +17,7 @@ $runnerArguments = @(
     '-ExecutionPolicy Bypass'
     '-File ' + (Quote-ProcessArgument $RunnerPath)
     (Quote-ProcessArgument $EnginePath)
-    (Quote-ProcessArgument $AudioPath)
+    (Quote-ProcessArgument $JobPath)
     (Quote-ProcessArgument $ResultPath)
 ) -join ' '
 

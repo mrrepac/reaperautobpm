@@ -1,5 +1,5 @@
 -- @description Detect beat BPM with TempoCNN and set project tempo
--- @version 2.0.0
+-- @version 2.0.1
 -- @author reaperplug
 -- @about
 --   Uses TempoCNN (deeptemp_k16).
@@ -16,6 +16,11 @@ local LAUNCHER_FILENAME = "launch_engine.ps1"
 local RUNNER_FILENAME = "run_engine.ps1"
 local MODEL_FILENAME = "deeptemp_k16.onnx"
 local RESULT_PREFIX = "bpm_result_"
+local JOB_PREFIX = "bpm_job_"
+
+-- How long the runner may take to announce itself before the launch counts as
+-- failed. Starting PowerShell twice is slow but nowhere near this.
+local LAUNCH_CONFIRM_MS = 20000
 
 local EXT_SECTION = "reaperplug_engine_bpm"
 local EXT_RUNNING_KEY = "analysis_started_at"
@@ -188,7 +193,8 @@ local function remove_stale_results(engine_directory)
   while true do
     local name = reaper.EnumerateFiles(engine_directory, index)
     if not name then break end
-    if name:sub(1, #RESULT_PREFIX) == RESULT_PREFIX then
+    if name:sub(1, #RESULT_PREFIX) == RESULT_PREFIX
+      or name:sub(1, #JOB_PREFIX) == JOB_PREFIX then
       stale[#stale + 1] = name
     end
     index = index + 1
@@ -225,6 +231,34 @@ local function read_text_file(path)
   return content
 end
 
+-- REAPER hands out paths as UTF-8. Written back byte for byte, so the runner
+-- can read the job file as UTF-8 and recover the original name exactly.
+local function write_text_file(path, content)
+  local file = io.open(path, "wb")
+  if not file then return false end
+  file:write(content)
+  file:close()
+  return true
+end
+
+-- os.execute routes through the ANSI C runtime, which reinterprets REAPER's
+-- UTF-8 bytes through the system codepage and destroys every non-Latin path.
+-- ExecProcess is REAPER's own launcher and converts to UTF-16 properly.
+local function start_detached(command)
+  if reaper.ExecProcess then
+    -- Detached mode returns nothing useful, so success is not judged here:
+    -- the runner's heartbeat file is what confirms the launch took.
+    reaper.ExecProcess(command, -2)
+    return true
+  end
+
+  local execute_result, execute_reason, execute_code = os.execute(command)
+  if execute_result == true or execute_result == 0 then return true end
+  return false, "Не удалось запустить движок в фоне. Код: "
+    .. tostring(execute_code or execute_result)
+    .. "; причина: " .. tostring(execute_reason or "неизвестна")
+end
+
 -- Analysis state --------------------------------------------------------------
 
 local function set_analysis_running(running)
@@ -258,47 +292,74 @@ local function async_engine(audio_path, on_complete)
 
   local unique = reaper.genGuid():gsub("[^%w]", "")
   local result_path = paths.directory .. SEPARATOR .. RESULT_PREFIX .. unique .. ".txt"
+  local job_path = paths.directory .. SEPARATOR .. JOB_PREFIX .. unique .. ".txt"
+
+  -- The audio path never travels on a command line: it is the one path that
+  -- routinely lives outside the ASCII range, and every shell hop is a chance
+  -- to mangle it. The engine folder sits next to the script and is passed as
+  -- arguments; ExecProcess keeps those intact.
+  if not write_text_file(job_path, audio_path) then
+    fail("Не удалось записать задание для движка:\n" .. job_path)
+    return false
+  end
+
   local windows_directory = os.getenv("WINDIR") or "C:\\Windows"
   local powershell_path = windows_directory
     .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
   if not reaper.file_exists(powershell_path) then
+    os.remove(job_path)
     fail("Не найден системный Windows PowerShell:\n" .. powershell_path)
     return false
   end
 
   -- The system path contains no spaces. Leaving the executable unquoted avoids
-  -- cmd.exe's special first-quote parsing used internally by os.execute.
+  -- the special first-quote parsing of the cmd.exe hop both launchers go through.
   local launch_command = powershell_path
     .. " -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "
     .. quote_argument(paths.launcher) .. " "
     .. quote_argument(paths.runner) .. " "
     .. quote_argument(paths.engine) .. " "
-    .. quote_argument(audio_path) .. " "
+    .. quote_argument(job_path) .. " "
     .. quote_argument(result_path)
 
-  local execute_result, execute_reason, execute_code = os.execute(launch_command)
-  local launch_ok = execute_result == true or execute_result == 0
+  local launch_ok, launch_error = start_detached(launch_command)
   if not launch_ok then
-    fail("Не удалось запустить движок в фоне. Код: "
-      .. tostring(execute_code or execute_result)
-      .. "; причина: " .. tostring(execute_reason or "неизвестна"))
+    os.remove(job_path)
+    fail(launch_error)
     return false
   end
 
   set_analysis_running(true)
   local started = reaper.time_precise()
+  -- The runner touches this the moment it starts, which turns a launch that
+  -- silently went nowhere into a fast error instead of a three-minute wait.
+  local heartbeat_path = result_path .. ".running"
+
+  local function finish()
+    os.remove(job_path)
+    set_analysis_running(false)
+  end
 
   local function poll()
     if reaper.file_exists(result_path) then
       local output = read_text_file(result_path)
       os.remove(result_path)
-      set_analysis_running(false)
+      finish()
       on_complete(parse_engine_output(output))
       return
     end
 
-    if (reaper.time_precise() - started) * 1000 > ANALYSIS_TIMEOUT_MS then
-      set_analysis_running(false)
+    local elapsed_ms = (reaper.time_precise() - started) * 1000
+
+    if elapsed_ms > LAUNCH_CONFIRM_MS and not reaper.file_exists(heartbeat_path) then
+      finish()
+      fail("Движок не запустился. Проверьте, что PowerShell не заблокирован политикой"
+        .. " безопасности, и что файлы в папке engine на месте.")
+      return
+    end
+
+    if elapsed_ms > ANALYSIS_TIMEOUT_MS then
+      finish()
       fail("Движок не завершил анализ за отведённое время.")
       return
     end
