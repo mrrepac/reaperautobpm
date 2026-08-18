@@ -1,4 +1,5 @@
 .superpowers/
+.worktrees/
 dev/model_conversion/.venv311/
 dev/model_conversion/.venv314/
 dev/model_conversion/build/
