@@ -1,0 +1,11 @@
+tempocnn==0.0.8
+tensorflow==2.17.0
+tf2onnx>=1.16.1
+# onnx pinned to 1.16.1 (not just >=1.16.0): pip's default resolution picks
+# onnx 1.19.x, which requires an ml_dtypes with float4_e2m1fn support that
+# conflicts with tensorflow-intel 2.17.0's ml_dtypes<0.5.0 pin
+# (AttributeError: module 'ml_dtypes' has no attribute 'float4_e2m1fn').
+# onnx 1.16.1 has no ml_dtypes dependency at all, so it's conflict-free here.
+onnx==1.16.1
+onnxruntime>=1.18.0
+numpy<2.0
