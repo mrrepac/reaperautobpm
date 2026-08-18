@@ -33,3 +33,22 @@ import time with:
 conflict-free alongside TensorFlow 2.17.0. All other packages installed
 at the versions specified/implied by `requirements.txt` with no further
 changes needed (tensorflow 2.17.0 has a working `cp311-win_amd64` wheel).
+
+## Building the engine executable
+
+`engine/tempocnn_engine.exe` is built separately from model conversion, in
+its own venv — the runtime dependencies in `engine/src/requirements.txt`
+do not include TensorFlow and must not be installed into the conversion
+venv above (or vice versa).
+
+    py -3.14 -m venv dev/model_conversion/.venv314
+    dev/model_conversion/.venv314/Scripts/python.exe -m pip install -r engine/src/requirements.txt
+
+Then, from the repo root:
+
+    dev/model_conversion/.venv314/Scripts/pyinstaller.exe --onefile --name tempocnn_engine --distpath engine --workpath dev/model_conversion/build --specpath dev/model_conversion engine/src/tempocnn_engine.py
+
+This produces `engine/tempocnn_engine.exe`. The model file
+`deeptemp_k16.onnx` is **not** embedded in the exe — it must be placed
+alongside it in `engine/` for the engine to find it at runtime, since
+`model_path()` resolves the model relative to the exe's own directory.

@@ -10,7 +10,7 @@ ReaScript определяет темп аудиофайла через **TempoC
 ```text
 Detect beat BPM and set project tempo.lua
 engine/
-  tempocnn_engine.exe
+  tempocnn_engine.exe    (~115 МБ)
   deeptemp_k16.onnx
   launch_engine.ps1
   run_engine.ps1
@@ -63,7 +63,7 @@ Lua-файл и папка `engine/` обязательны и должны со
 Одно поле с найденным BPM. Заголовок выглядит так:
 
 ```text
-Detected 140 BPM (half 70 / double 280, conf 2.70)
+Detected 140 BPM (half 70 / double 280, conf 0.84)
 ```
 
 Половинный и удвоенный варианты выписаны сразу, потому что метрический уровень — самая
@@ -112,6 +112,6 @@ SHA-256 `deeptemp_k16.onnx`:
 4D41FCC576C0B510DFB807A5A19BC04A1D77EDF6AF9341A9F7982B06F1B921C5
 ```
 
-Как воспроизвести сборку — `dev/model_conversion/README.md`.
+Как воспроизвести сборку модели (.onnx) и exe-движка — `dev/model_conversion/README.md`.
 
 Сведения о происхождении и лицензии — `THIRD_PARTY_NOTICES.md`.

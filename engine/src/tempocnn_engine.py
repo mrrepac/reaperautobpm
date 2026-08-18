@@ -1,6 +1,6 @@
 """TempoCNN-based BPM engine for the "Detect beat BPM" REAPER action.
 
-Feature extraction (read_features/_ensure_length/_add_zeros/_to_sliding_window)
+Feature extraction (read_features/_ensure_length/_to_sliding_window)
 and normalization (std_normalizer) below are ported from tempo-cnn
 (https://github.com/hendriks73/tempo-cnn), Copyright Hendrik Schreiber,
 licensed under AGPLv3 (https://www.gnu.org/licenses/agpl-3.0.html).
