@@ -20,7 +20,7 @@ try {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     if (-not $process.Start()) {
-        throw 'ProcessStartInfo could not start Essentia.'
+        throw 'ProcessStartInfo could not start the engine.'
     }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -36,10 +36,10 @@ try {
 
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
-    $content = $stdout + $stderr + "`r`n__ESSENTIA_EXIT__=$exitCode`r`n"
+    $content = $stdout + $stderr + "`r`n__ENGINE_EXIT__=$exitCode`r`n"
 }
 catch {
-    $content = "Essentia runner error: $($_.Exception.Message)`r`n__ESSENTIA_EXIT__=125`r`n"
+    $content = "Engine runner error: $($_.Exception.Message)`r`n__ENGINE_EXIT__=125`r`n"
 }
 
 [System.IO.File]::WriteAllText($workingPath, $content, [System.Text.Encoding]::UTF8)
