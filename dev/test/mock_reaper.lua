@@ -29,14 +29,29 @@ function reaper.TakeIsMIDI() return false end
 function reaper.GetMediaItemTake_Source() return SOURCE end
 function reaper.GetMediaSourceParent() return nil end
 function reaper.GetMediaSourceFileName() return config.audio_path end
-function reaper.GetMediaItemTakeInfo_Value() return 1 end
 function reaper.GetMediaFileMetadata() return 0, "" end
+
+-- Per-parameter, because the script now reads the take's start offset and the
+-- source length to work out which region of the file to analyse; a mock that
+-- answered the same number to every query would hide a swapped parameter.
+function reaper.GetMediaItemTakeInfo_Value(_, parameter)
+  if parameter == "D_PLAYRATE" then return config.playrate or 1 end
+  if parameter == "D_STARTOFFS" then return config.start_offset or 0 end
+  return 0
+end
+
+function reaper.GetMediaSourceLength()
+  return config.source_length or 0, false
+end
 function reaper.ValidatePtr2() return true end
 function reaper.CountMediaItems() return 1 end
 function reaper.GetMediaItem() return ITEM end
 function reaper.GetSelectedTrack() return nil end
 function reaper.GetMediaItem_Track() return "track" end
-function reaper.GetMediaItemInfo_Value() return 0 end
+function reaper.GetMediaItemInfo_Value(_, parameter)
+  if parameter == "D_LENGTH" then return config.item_length or 0 end
+  return 0
+end
 function reaper.GetCursorPositionEx() return 0 end
 
 -- Tempo -----------------------------------------------------------------------
@@ -110,19 +125,33 @@ function M.window_open() return gfx_open end
 
 M.ticks = 0
 
-function M.run(script_path, timeout_ticks)
+function M.run(script_path, timeout_ticks, passes)
   local chunk, err = loadfile(script_path)
   if not chunk then error("load failed: " .. tostring(err)) end
-  chunk()
 
-  while M.deferred and M.ticks < (timeout_ticks or 4000) do
-    local fn = M.deferred
-    M.deferred = nil
-    M.ticks = M.ticks + 1
-    fn()
-    if M.deferred then host.tick() end
+  -- Several passes share one host, which is how the session result cache
+  -- becomes observable: pass two must not launch the engine again.
+  for _ = 1, (passes or 1) do
+    M.atexit, M.deferred = nil, nil
+    chunk()
+
+    while M.deferred and M.ticks < (timeout_ticks or 4000) do
+      local fn = M.deferred
+      M.deferred = nil
+      M.ticks = M.ticks + 1
+      fn()
+      if M.deferred then host.tick() end
+    end
+    if M.atexit then M.atexit() end
   end
-  if M.atexit then M.atexit() end
+end
+
+function M.prompts()
+  local out = {}
+  for _, entry in ipairs(M.log) do
+    if entry.kind == "prompt" then out[#out + 1] = entry.value end
+  end
+  return out
 end
 
 function M.messages()

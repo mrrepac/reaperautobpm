@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 
 from lupa import LuaRuntime
@@ -28,6 +29,27 @@ AUDIO = WORKDIR / "Бит_Мр--Точка.wav"
 shutil.copyfile(REPO / "dev" / "test_audio" / "click_120bpm.wav", AUDIO)
 
 failures = []
+
+
+def build_mixed_fixture(path):
+    """90 / 112.5 / 90 BPM in three 20 s thirds, spliced from the committed
+    fixtures with the standard library so the test needs no numpy."""
+    parts = ["click_90bpm", "groove_112_5bpm", "click_90bpm"]
+    frames = []
+    for name in parts:
+        with wave.open(str(REPO / "dev" / "test_audio" / f"{name}.wav"), "rb") as f:
+            params = f.getparams()
+            frames.append(f.readframes(f.getnframes()))
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(params.nchannels)
+        out.setsampwidth(params.sampwidth)
+        out.setframerate(params.framerate)
+        out.writeframes(b"".join(frames))
+
+
+def prompt_titles(mock):
+    """Lua tables come back as objects, and iterating one yields its keys."""
+    return [str(value) for value in mock.prompts().values()]
 
 
 def check(name, condition, detail=""):
@@ -97,25 +119,33 @@ class Host:
         return ""
 
 
-def run_case(name, options, clock="real", timeout_ticks=4000):
+def run_case(name, options, clock="real", timeout_ticks=4000, passes=1):
     print(f"\n{name}")
     host = Host(clock)
     lua = LuaRuntime(unpack_returned_tuples=True)
     mock = lua.eval(f"loadfile([[{MOCK}]])")(host)
     mock.configure(lua.table_from({**options, "script_path": str(SCRIPT)}))
-    mock.run(str(SCRIPT), timeout_ticks)
+    mock.run(str(SCRIPT), timeout_ticks, passes)
     # Anything the script left behind is only visible once the background chain
     # it started has finished writing.
     host.wait_all()
     return mock, host
 
 
-def wait_for_leftovers(timeout=90):
-    """The detached runner outlives the launcher, so its output arrives late."""
+def wait_for_orphan_result(timeout=90):
+    """The detached runner outlives the launcher, so its output arrives late.
+
+    Waited on specifically: the settled result file, not the `.running`
+    heartbeat that precedes it. Sweeping while only the heartbeat exists leaves
+    the runner to rename it into place afterwards, re-creating a leftover behind
+    the sweep -- a race the engine is now fast enough to lose reliably.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if engine_leftovers():
-            return engine_leftovers()
+        settled = [name for name in engine_leftovers()
+                   if name.startswith("bpm_result_") and name.endswith(".txt")]
+        if settled:
+            return settled
         time.sleep(0.2)
     return []
 
@@ -171,8 +201,8 @@ check("toolbar cleared", list(mock.toolbar.values()) == [1, 0],
 check("cancel is silent", mock.messages() == "", mock.messages())
 # The engine was left running, so its result lands after nobody is waiting.
 # That orphan is expected; the next run is what sweeps it up.
-orphans = wait_for_leftovers()
-check("cancelled run leaves an orphan", orphans != [], "engine wrote nothing")
+orphans = wait_for_orphan_result()
+check("cancelled run leaves an orphan", orphans != [], "engine wrote no result")
 
 # 5 -- launch silently goes nowhere: must fail fast, not sit out the 3 minutes.
 mock, _ = run_case(
@@ -186,13 +216,57 @@ check("tempo untouched", mock.bpm_set is None)
 check("own job file removed, and case 4's orphan swept up",
       engine_leftovers() == [], str(engine_leftovers()))
 
-# 6 -- exact BPM in the filename skips the engine entirely.
+# 6 -- a filename hint that contradicts the engine. The hint no longer short
+# circuits the analysis: a tempo written into a name or a tag is frequently
+# wrong about the metric level, so both are obtained and the engine wins.
 named = WORKDIR / "Трек 128 BPM.wav"
 shutil.copyfile(AUDIO, named)
-mock, host = run_case("6. Filename hint bypasses the engine", {"audio_path": str(named)})
-check("engine not launched", len(host.launched) == 0)
-check("hinted tempo applied", mock.bpm_set == 128, f"got {mock.bpm_set}")
-check("no progress window", not mock.window_open())
+mock, host = run_case("6. Filename hint contradicts the engine",
+                      {"audio_path": str(named)})
+check("engine still launched", len(host.launched) == 1)
+check("engine tempo wins", mock.bpm_set == 120, f"got {mock.bpm_set}")
+check("disagreement is spelled out", "≠" in "".join(prompt_titles(mock)),
+      "".join(prompt_titles(mock)))
+
+# 7 -- a filename hint the engine agrees with keeps its own precision. 119.75
+# is not on the 0.5 grid, and an exact number is not improved by being snapped
+# to one.
+agreeing = WORKDIR / "Трек 119.75 BPM.wav"
+shutil.copyfile(AUDIO, agreeing)
+mock, _ = run_case("7. Filename hint the engine agrees with",
+                   {"audio_path": str(agreeing)})
+check("exact hint applied unrounded", mock.bpm_set == 119.75, f"got {mock.bpm_set}")
+check("agreement is spelled out", "≈" in "".join(prompt_titles(mock)),
+      "".join(prompt_titles(mock)))
+
+# 8 -- a trimmed item is analysed over its own region only. The file runs
+# 90 / 112.5 / 90 BPM in 20 s thirds; the whole file reads as 180, so a result
+# of 112.5 can only come from the middle third actually being what was sent.
+mixed = WORKDIR / "Смешанный темп.wav"
+build_mixed_fixture(mixed)
+mock, host = run_case(
+    "8. Trimmed item is analysed over its own region",
+    {"audio_path": str(mixed), "start_offset": 20.0, "item_length": 20.0,
+     "source_length": 60.0},
+)
+check("engine launched", len(host.launched) == 1)
+check("region tempo applied, not the whole file's", mock.bpm_set == 112.5,
+      f"got {mock.bpm_set}")
+
+# 9 -- the same item twice in one session: the second run is served from the
+# result cache and must not start the engine again.
+mock, host = run_case(
+    "9. Second run on the same item hits the cache",
+    {"audio_path": str(AUDIO)}, passes=2,
+)
+check("engine launched once for two runs", len(host.launched) == 1,
+      f"{len(host.launched)} launches")
+check("both runs applied a tempo", mock.bpm_set == 120, f"got {mock.bpm_set}")
+check("two prompts shown", len(prompt_titles(mock)) == 2,
+      str(prompt_titles(mock)))
+check("second prompt says it came from the cache",
+      "кэш" in prompt_titles(mock)[1], prompt_titles(mock)[1])
+check("no progress window the second time", not mock.window_open())
 
 shutil.rmtree(WORKDIR.parent, ignore_errors=True)
 

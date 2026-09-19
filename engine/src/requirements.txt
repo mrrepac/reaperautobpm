@@ -1,5 +1,9 @@
-librosa>=0.11.0
-soundfile>=0.12.1
+# Engine runtime. librosa is deliberately absent: decoding and resampling go
+# straight to soundfile/soxr (what librosa calls underneath) and the mel
+# spectrogram is computed in numpy, which drops numba, scipy and joblib.
+# Equivalence is asserted by dev/model_conversion/verify_frontend_parity.py.
 numpy
+soundfile>=0.12.1
+soxr>=0.3.7
 onnxruntime>=1.18.0
 pyinstaller>=6.0.0

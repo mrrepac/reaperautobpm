@@ -33,16 +33,16 @@ function ConvertTo-EngineText([string]$Raw) {
 [System.IO.File]::WriteAllText($workingPath, "started`r`n", $utf8)
 
 try {
-    # The audio path arrives through a UTF-8 file rather than a command line:
-    # non-Latin names do not survive the ANSI hops on the way here.
-    $audioPath = [System.IO.File]::ReadAllText($JobPath, [System.Text.Encoding]::UTF8).Trim()
-    if ([string]::IsNullOrWhiteSpace($audioPath)) {
-        throw "Job file holds no audio path: $JobPath"
+    if (-not (Test-Path -LiteralPath $JobPath)) {
+        throw "Job file is missing: $JobPath"
     }
 
+    # The job file carries the audio path and the region to analyse, and the
+    # engine reads it itself: a non-Latin path does not survive the ANSI hops
+    # on the way here, so it never travels as an argument.
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $EnginePath
-    $startInfo.Arguments = '"' + $audioPath.Replace('"', '\"') + '"'
+    $startInfo.Arguments = '--job "' + $JobPath.Replace('"', '\"') + '"'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true

@@ -1,17 +1,27 @@
 -- @description Detect beat BPM with TempoCNN and set project tempo
--- @version 2.1.0
+-- @version 3.0.0
 -- @author reaperplug
 -- @about
 --   Uses TempoCNN (deeptemp_k16).
 --   Select an audio item (or park the edit cursor on one), then run the script.
---   The detected BPM is shown for confirmation before the project tempo changes.
+--   Only the item's own audio region is analysed, and the detected BPM is shown
+--   for confirmation before the project tempo changes.
 
 local ANALYSIS_TIMEOUT_MS = 180000
 
 local MIN_ACCEPTED_BPM = 20
 local MAX_ACCEPTED_BPM = 960
 
-local ENGINE_FILENAME = "tempocnn_engine.exe"
+-- Tempo grid. Half-BPM tempos are real material -- 112.5 and 87.5 both turned
+-- up in practice -- and the engine's fine refinement resolves them to about
+-- 0.05 BPM, so a 0.5 step is measured rather than decorative.
+local BPM_STEP = 0.5
+-- A value the engine derived exactly (whole bars in the item, or a number read
+-- out of the file) is not improved by the grid, so it is only snapped when it
+-- lands on one anyway. Otherwise an exact 117.333 would become a wrong 117.5.
+local EXACT_SNAP_TOLERANCE = 0.06
+
+local ENGINE_FILENAME = "tempocnn_engine" .. package.config:sub(1, 1) .. "tempocnn_engine.exe"
 local LAUNCHER_FILENAME = "launch_engine.ps1"
 local RUNNER_FILENAME = "run_engine.ps1"
 local MODEL_FILENAME = "deeptemp_k16.onnx"
@@ -24,6 +34,19 @@ local LAUNCH_CONFIRM_MS = 20000
 
 local EXT_SECTION = "reaperplug_engine_bpm"
 local EXT_RUNNING_KEY = "analysis_started_at"
+local EXT_CACHE_KEY = "analysis_cache"
+
+-- Results are kept for the session only. Keyed on path, size and region, which
+-- cannot notice a file rewritten to the same byte count -- a session-long
+-- window makes that unreachable in practice, and re-running on the same item
+-- (to compare half against double, say) is the case worth serving.
+local CACHE_LIMIT = 48
+
+-- Below this share of windows agreeing, the file does not have one tempo, and
+-- a single project tempo is the wrong answer for it.
+local AGREEMENT_FLOOR = 0.6
+-- A runner-up metric level is worth naming only if the network gave it weight.
+local CANDIDATE_FLOOR = 0.05
 
 local SEPARATOR = package.config:sub(1, 1)
 
@@ -127,9 +150,28 @@ function toolbar.set(state)
   reaper.RefreshToolbar2(section, command)
 end
 
--- Whole numbers only: a fractional project tempo is not what this action is for.
-local function round_bpm(bpm)
-  return math.floor(bpm + 0.5)
+-- Tempo values ----------------------------------------------------------------
+
+-- The detected tempo is snapped to the 0.5 grid; a value the engine derived
+-- exactly keeps its own precision unless the grid happens to fit it.
+local function quantize_bpm(bpm, exact)
+  local snapped = math.floor(bpm / BPM_STEP + 0.5) * BPM_STEP
+  if exact and math.abs(snapped - bpm) > EXACT_SNAP_TOLERANCE then
+    return math.floor(bpm * 1000 + 0.5) / 1000
+  end
+  return snapped
+end
+
+-- A typed tempo is an assertion, not an estimate, so it is taken as written --
+-- including the 56.25 that halving a 112.5 track actually needs.
+local function round_typed_bpm(bpm)
+  return math.floor(bpm * 1000 + 0.5) / 1000
+end
+
+local function format_bpm(bpm)
+  local text = string.format("%.3f", bpm)
+  text = text:gsub("0+$", ""):gsub("%.$", "")
+  return text
 end
 
 -- Target item -----------------------------------------------------------------
@@ -204,14 +246,58 @@ local function resolve_target(project)
     "Нечего анализировать. Выделите audio item с битом или поставьте на него edit-курсор."
 end
 
+-- Returns the file-backed source, plus whether the take reached it through a
+-- wrapper (a section or a reversed take). A wrapper puts the take's own offsets
+-- in different coordinates than the file's, so the region is not computed then.
 local function root_source(take)
   local source = reaper.GetMediaItemTake_Source(take)
+  local nested = false
   while source do
     local parent = reaper.GetMediaSourceParent(source)
     if not parent then break end
+    nested = true
     source = parent
   end
-  return source
+  return source, nested
+end
+
+local function take_playrate(take)
+  local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+  if not playrate or playrate <= 0 then return 1 end
+  return playrate
+end
+
+-- Analysis region -------------------------------------------------------------
+
+-- Everything here is in source time: the offset already is, and the item's
+-- length is multiplied by the play rate to get there.
+--
+-- Without this the engine was handed the whole file no matter how the item was
+-- trimmed, so eight bars lifted out of an hour-long set were answered with the
+-- average tempo of the set.
+local function analysis_region(item, take, source, nested)
+  if nested then return {} end
+
+  local playrate = take_playrate(take)
+  local offset = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+  local length = (reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0) * playrate
+  if offset < 0 then offset = 0 end
+  if length <= 0 then return {} end
+
+  local source_length = reaper.GetMediaSourceLength(source)
+  if source_length and source_length > 0 then
+    if offset >= source_length then return {} end
+    -- A looped item runs past its source; one pass through it is the material.
+    if offset + length > source_length then
+      length = source_length - offset
+    end
+    -- Whole file anyway: leave the region out so the engine reads it in one go.
+    if offset <= 0.001 and length >= source_length - 0.001 then
+      return { snap_length = length }
+    end
+  end
+
+  return { offset = offset, duration = length, snap_length = length }
 end
 
 -- Exact hints -----------------------------------------------------------------
@@ -224,7 +310,7 @@ local function parse_bpm(text)
   return nil
 end
 
-local function exact_bpm_hint(take, source)
+local function exact_bpm_hint(source)
   if reaper.GetMediaFileMetadata then
     local ok, identifiers = reaper.GetMediaFileMetadata(source, "")
     if ok and ok ~= 0 and identifiers then
@@ -300,6 +386,15 @@ local function remove_stale_results(engine_directory)
   end
 end
 
+local function parse_candidates(text)
+  local candidates = {}
+  if not text then return candidates end
+  for bpm, mass in text:gmatch("([%d%.]+):([%d%.]+)") do
+    candidates[#candidates + 1] = { bpm = tonumber(bpm), mass = tonumber(mass) }
+  end
+  return candidates
+end
+
 local function parse_engine_output(output)
   local engine_exit = output and tonumber(output:match("__ENGINE_EXIT__=(%-?%d+)")) or nil
   if engine_exit == nil then
@@ -314,7 +409,12 @@ local function parse_engine_output(output)
   end
   return {
     bpm = bpm,
+    bpm_cnn = tonumber(output:match("bpm_cnn:%s*([%d%.]+)")) or bpm,
     confidence = tonumber(output:match("confidence:%s*([%d%.%-]+)")) or 0,
+    origin = output:match("origin:%s*(%a+)") or "cnn",
+    agreement = tonumber(output:match("agreement:%s*([%d%.]+)")) or 1,
+    loop_beats = tonumber(output:match("loop_beats:%s*(%d+)")),
+    candidates = output:match("candidates:%s*([^\r\n]*)") or "",
   }
 end
 
@@ -352,6 +452,73 @@ local function start_detached(command)
   return false, "Не удалось запустить движок в фоне. Код: "
     .. tostring(execute_code or execute_result)
     .. "; причина: " .. tostring(execute_reason or "неизвестна")
+end
+
+-- Result cache ----------------------------------------------------------------
+
+local function file_size(path)
+  local file = io.open(path, "rb")
+  if not file then return 0 end
+  local size = file:seek("end") or 0
+  file:close()
+  return size
+end
+
+local function cache_signature(path, region)
+  return string.format("%s|%d|%.3f|%.3f", path, file_size(path),
+    region.offset or 0, region.duration or 0)
+end
+
+local function cache_records()
+  local records = {}
+  for record in reaper.GetExtState(EXT_SECTION, EXT_CACHE_KEY):gmatch("[^\n]+") do
+    records[#records + 1] = record
+  end
+  return records
+end
+
+local function cache_lookup(signature)
+  for _, record in ipairs(cache_records()) do
+    local fields = {}
+    for field in (record .. "\t"):gmatch("([^\t]*)\t") do
+      fields[#fields + 1] = field
+    end
+    if fields[1] == signature then
+      return {
+        bpm = tonumber(fields[2]),
+        bpm_cnn = tonumber(fields[3]) or tonumber(fields[2]),
+        confidence = tonumber(fields[4]) or 0,
+        origin = fields[5] or "cnn",
+        agreement = tonumber(fields[6]) or 1,
+        loop_beats = tonumber(fields[7]),
+        candidates = fields[8] or "",
+        cached = true,
+      }
+    end
+  end
+  return nil
+end
+
+local function cache_store(signature, result)
+  local record = table.concat({
+    signature,
+    string.format("%.4f", result.bpm),
+    string.format("%.4f", result.bpm_cnn or result.bpm),
+    string.format("%.4f", result.confidence or 0),
+    result.origin or "cnn",
+    string.format("%.4f", result.agreement or 1),
+    result.loop_beats and tostring(result.loop_beats) or "",
+    result.candidates or "",
+  }, "\t")
+
+  local kept = { record }
+  for _, existing in ipairs(cache_records()) do
+    if #kept >= CACHE_LIMIT then break end
+    if existing:sub(1, #signature + 1) ~= signature .. "\t" then
+      kept[#kept + 1] = existing
+    end
+  end
+  reaper.SetExtState(EXT_SECTION, EXT_CACHE_KEY, table.concat(kept, "\n"), false)
 end
 
 -- Analysis state --------------------------------------------------------------
@@ -399,7 +566,21 @@ local function analysis_in_progress()
   return true
 end
 
-local function async_engine(audio_path, on_complete)
+local function job_contents(audio_path, region)
+  local lines = { "path=" .. audio_path }
+  if region.offset and region.offset > 0 then
+    lines[#lines + 1] = string.format("offset=%.6f", region.offset)
+  end
+  if region.duration and region.duration > 0 then
+    lines[#lines + 1] = string.format("duration=%.6f", region.duration)
+  end
+  if region.snap_length and region.snap_length > 0 then
+    lines[#lines + 1] = string.format("snap_length=%.6f", region.snap_length)
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+local function async_engine(audio_path, region, on_complete)
   local paths, paths_error = engine_paths()
   if not paths then
     fail(paths_error)
@@ -416,7 +597,7 @@ local function async_engine(audio_path, on_complete)
   -- routinely lives outside the ASCII range, and every shell hop is a chance
   -- to mangle it. The engine folder sits next to the script and is passed as
   -- arguments; ExecProcess keeps those intact.
-  if not write_text_file(job_path, audio_path) then
+  if not write_text_file(job_path, job_contents(audio_path, region)) then
     fail("Не удалось записать задание для движка:\n" .. job_path)
     return false
   end
@@ -510,14 +691,7 @@ end
 
 -- Tempo -----------------------------------------------------------------------
 
-local function take_playrate(take)
-  local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
-  if not playrate or playrate <= 0 then return 1 end
-  return playrate
-end
-
 local function apply_result(project, item, bpm)
-  bpm = round_bpm(bpm)
   reaper.Undo_BeginBlock()
   -- Project tempo must change without stretching the reference beat.
   reaper.SetMediaItemInfo_Value(item, "C_BEATATTACHMODE", 0)
@@ -527,34 +701,92 @@ local function apply_result(project, item, bpm)
   return bpm
 end
 
+-- Presentation ----------------------------------------------------------------
+
+-- Merges what the engine heard with what the file claims, and words the
+-- result. The returned bpm is what the prompt offers; everything else is the
+-- caption that says where it came from and what else it could be.
+local function describe(result, hint_bpm, hint_origin, playrate)
+  local engine_bpm = result.bpm * playrate
+  local exact = result.origin == "loop"
+  -- Whole bars in the item pin the tempo exactly, so that is worth saying in
+  -- place of a confidence the exact answer did not come from.
+  local engine_note = result.loop_beats
+    and string.format("loop %d долей", result.loop_beats)
+    or string.format("conf %.2f", result.confidence)
+  local notes = {}
+  local chosen
+
+  if hint_bpm then
+    local hinted = hint_bpm * playrate
+    -- A number written into the file is exact where the engine only estimates,
+    -- so when the two agree the written one is the better answer -- and it is
+    -- the one that can carry a .5. When they disagree the engine wins: a tag
+    -- copied by DJ software is most often wrong about the metric level, which
+    -- is exactly what half/double in the caption is for.
+    if math.abs(hinted - engine_bpm) <= engine_bpm * 0.02 then
+      chosen, exact = hinted, true
+      notes[#notes + 1] = hint_origin .. " ≈ " .. format_bpm(engine_bpm)
+    else
+      chosen = engine_bpm
+      notes[#notes + 1] = engine_note
+      notes[#notes + 1] = hint_origin .. " " .. format_bpm(hinted) .. " ≠"
+    end
+  else
+    chosen = engine_bpm
+    notes[#notes + 1] = engine_note
+  end
+
+  local bpm = quantize_bpm(chosen, exact)
+
+  -- The network's own runner-up, when it has one, says more about the metric
+  -- level than arithmetic does.
+  for _, candidate in ipairs(parse_candidates(result.candidates)) do
+    local candidate_bpm = candidate.bpm * playrate
+    if candidate.mass >= CANDIDATE_FLOOR
+      and math.abs(candidate_bpm - bpm) > bpm * 0.04 then
+      notes[#notes + 1] = string.format("ещё %s (%.2f)",
+        format_bpm(quantize_bpm(candidate_bpm, false)), candidate.mass)
+      break
+    end
+  end
+
+  if (result.agreement or 1) < AGREEMENT_FLOOR then
+    notes[#notes + 1] = "темп непостоянный"
+  end
+  if result.cached then
+    notes[#notes + 1] = "кэш"
+  end
+
+  return bpm, string.format("%s BPM · half %s / double %s · %s",
+    format_bpm(bpm), format_bpm(bpm / 2), format_bpm(bpm * 2),
+    table.concat(notes, ", "))
+end
+
 -- Confirmation ----------------------------------------------------------------
 
 -- Returns a choice table, or nil plus an error message. Both nil means cancel.
-local function confirm(detected_bpm, origin)
-  local rounded = round_bpm(detected_bpm)
-  -- Metrical level is the tracker's weakest guess, so both neighbours are
-  -- spelled out and either one is a single keystroke away.
-  local title = string.format("Detected %d BPM (half %d / double %d, %s)",
-    rounded, round_bpm(detected_bpm / 2), round_bpm(detected_bpm * 2), origin)
-  local ok, value = reaper.GetUserInputs(title, 1, "BPM:,extrawidth=100", tostring(rounded))
+local function confirm(bpm, title)
+  local ok, value = reaper.GetUserInputs(title, 1, "BPM:,extrawidth=100",
+    format_bpm(bpm))
   if not ok then return nil end
 
-  local bpm = tonumber((value or ""):match("^%s*(.-)%s*$"))
-  if not bpm or bpm < MIN_ACCEPTED_BPM or bpm > MAX_ACCEPTED_BPM then
+  local typed = tonumber(((value or ""):gsub(",", ".")):match("^%s*(.-)%s*$"))
+  if not typed or typed < MIN_ACCEPTED_BPM or typed > MAX_ACCEPTED_BPM then
     return nil, string.format(
       "Введите BPM числом от %d до %d.", MIN_ACCEPTED_BPM, MAX_ACCEPTED_BPM
     )
   end
-  return { bpm = bpm }
+  return { bpm = round_typed_bpm(typed) }
 end
 
-local function confirm_and_apply(project, item, bpm, origin)
+local function confirm_and_apply(project, item, bpm, title)
   if not reaper.ValidatePtr2(project, item, "MediaItem*") then
     fail("Анализ завершён, но исходный item или проект уже закрыт.")
     return
   end
 
-  local choice, input_error = confirm(bpm, origin)
+  local choice, input_error = confirm(bpm, title)
   if input_error then
     fail(input_error)
     return
@@ -580,35 +812,46 @@ local function main()
     return
   end
 
-  local source = root_source(take)
+  local source, nested = root_source(take)
   if not source then
     fail("Не удалось получить media source выбранного take.")
     return
   end
 
   local playrate = take_playrate(take)
-
-  local hinted_bpm, hint_origin = exact_bpm_hint(take, source)
-  if hinted_bpm then
-    -- An exact hint is trusted as written; only playrate can move it.
-    confirm_and_apply(project, item, hinted_bpm * playrate, hint_origin)
-    return
-  end
+  local region = analysis_region(item, take, source, nested)
+  local hinted_bpm, hint_origin = exact_bpm_hint(source)
 
   local audio_path = reaper.GetMediaSourceFileName(source)
   if not audio_path or audio_path == "" or not reaper.file_exists(audio_path) then
+    -- Nothing to analyse, but a number written into the take is still a number.
+    if hinted_bpm then
+      local bpm = quantize_bpm(hinted_bpm * playrate, true)
+      confirm_and_apply(project, item, bpm, string.format(
+        "%s BPM · half %s / double %s · %s", format_bpm(bpm),
+        format_bpm(bpm / 2), format_bpm(bpm * 2), hint_origin))
+      return
+    end
     fail("Движок может анализировать только audio source, сохранённый как файл.")
     return
   end
 
-  async_engine(audio_path, function(result, analysis_error)
+  local signature = cache_signature(audio_path, region)
+  local cached = cache_lookup(signature)
+  if cached then
+    local bpm, title = describe(cached, hinted_bpm, hint_origin, playrate)
+    confirm_and_apply(project, item, bpm, title)
+    return
+  end
+
+  async_engine(audio_path, region, function(result, analysis_error)
     if not result then
       fail(analysis_error)
       return
     end
-    local effective_bpm = result.bpm * playrate
-    local origin = string.format("conf %.2f", result.confidence)
-    confirm_and_apply(project, item, effective_bpm, origin)
+    cache_store(signature, result)
+    local bpm, title = describe(result, hinted_bpm, hint_origin, playrate)
+    confirm_and_apply(project, item, bpm, title)
   end)
 end
 
