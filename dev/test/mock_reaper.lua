@@ -50,6 +50,7 @@ function reaper.GetSelectedTrack() return nil end
 function reaper.GetMediaItem_Track() return "track" end
 function reaper.GetMediaItemInfo_Value(_, parameter)
   if parameter == "D_LENGTH" then return config.item_length or 0 end
+  if parameter == "B_LOOPSRC" then return config.loop_source and 1 or 0 end
   return 0
 end
 function reaper.GetCursorPositionEx() return 0 end
@@ -58,8 +59,8 @@ function reaper.GetCursorPositionEx() return 0 end
 
 function reaper.SetCurrentBPM(_, bpm) M.bpm_set = bpm; record("bpm", bpm) end
 function reaper.SetMediaItemInfo_Value() end
-function reaper.Undo_BeginBlock() end
-function reaper.Undo_EndBlock() end
+function reaper.Undo_BeginBlock2(project) assert(project == PROJECT) end
+function reaper.Undo_EndBlock2(project) assert(project == PROJECT) end
 function reaper.UpdateArrange() end
 
 -- Script context --------------------------------------------------------------

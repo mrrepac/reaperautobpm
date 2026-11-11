@@ -285,19 +285,24 @@ local function analysis_region(item, take, source, nested)
   if length <= 0 then return {} end
 
   local source_length = reaper.GetMediaSourceLength(source)
+  local wrap = false
   if source_length and source_length > 0 then
+    if reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1 then
+      offset = offset % source_length
+      length = math.min(length, source_length)
+      wrap = offset + length > source_length
+    end
     if offset >= source_length then return {} end
-    -- A looped item runs past its source; one pass through it is the material.
-    if offset + length > source_length then
+    if not wrap and offset + length > source_length then
       length = source_length - offset
     end
     -- Whole file anyway: leave the region out so the engine reads it in one go.
-    if offset <= 0.001 and length >= source_length - 0.001 then
+    if not wrap and offset <= 0.001 and length >= source_length - 0.001 then
       return { snap_length = length }
     end
   end
 
-  return { offset = offset, duration = length, snap_length = length }
+  return { offset = offset, duration = length, snap_length = length, wrap = wrap }
 end
 
 -- Exact hints -----------------------------------------------------------------
@@ -401,6 +406,9 @@ local function parse_engine_output(output)
     return nil, "Результат анализа повреждён или не завершён."
   end
   if engine_exit ~= 0 then
+    if output:find("selected audio region is silent", 1, true) then
+      return nil, "В выбранном фрагменте тишина. Определить BPM невозможно."
+    end
     return nil, "Движок завершился с кодом " .. tostring(engine_exit) .. ":\n" .. output
   end
   local bpm = tonumber(output:match("bpm:%s*([%d%.]+)"))
@@ -465,8 +473,8 @@ local function file_size(path)
 end
 
 local function cache_signature(path, region)
-  return string.format("%s|%d|%.3f|%.3f", path, file_size(path),
-    region.offset or 0, region.duration or 0)
+  return string.format("%s|%d|%.6f|%.6f|%s", path, file_size(path),
+    region.offset or 0, region.duration or 0, tostring(region.wrap == true))
 end
 
 local function cache_records()
@@ -577,6 +585,7 @@ local function job_contents(audio_path, region)
   if region.snap_length and region.snap_length > 0 then
     lines[#lines + 1] = string.format("snap_length=%.6f", region.snap_length)
   end
+  if region.wrap then lines[#lines + 1] = "wrap=1" end
   return table.concat(lines, "\n") .. "\n"
 end
 
@@ -692,11 +701,11 @@ end
 -- Tempo -----------------------------------------------------------------------
 
 local function apply_result(project, item, bpm)
-  reaper.Undo_BeginBlock()
+  reaper.Undo_BeginBlock2(project)
   -- Project tempo must change without stretching the reference beat.
   reaper.SetMediaItemInfo_Value(item, "C_BEATATTACHMODE", 0)
   reaper.SetCurrentBPM(project, bpm, false)
-  reaper.Undo_EndBlock("Detect beat BPM with TempoCNN and set project tempo", -1)
+  reaper.Undo_EndBlock2(project, "Detect beat BPM with TempoCNN and set project tempo", -1)
   reaper.UpdateArrange()
   return bpm
 end

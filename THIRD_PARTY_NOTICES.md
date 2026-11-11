@@ -26,7 +26,7 @@ SHA-256 of the shipped files:
 
 `tempocnn_engine/tempocnn_engine.exe`:
 ```text
-F228089572025EA432D021601DC416A32D599B1431AF91468E9DC6311385B963
+1B18C54B60451C0E62474C29BA71611DC560AE31EA62A027B99076A874306E9C
 ```
 
 The model hash is the stable one: it identifies the converted weights and does

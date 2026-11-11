@@ -268,6 +268,36 @@ check("second prompt says it came from the cache",
       "кэш" in prompt_titles(mock)[1], prompt_titles(mock)[1])
 check("no progress window the second time", not mock.window_open())
 
+with wave.open(str(REPO / "dev/test_audio/click_140bpm.wav"), "rb") as audio:
+    params = audio.getparams()
+    fast = audio.readframes(audio.getnframes())
+with wave.open(str(REPO / "dev/test_audio/click_90bpm.wav"), "rb") as audio:
+    slow = audio.readframes(audio.getnframes())
+
+wrapped = WORKDIR / "wrapped.wav"
+with wave.open(str(wrapped), "wb") as audio:
+    audio.setparams(params)
+    audio.writeframes(fast + slow * 2)
+mock, _ = run_case(
+    "10. Looped item crosses the end of the source",
+    {"audio_path": str(wrapped), "loop_source": True, "start_offset": 59,
+     "item_length": 21, "source_length": 60},
+)
+check("analysis includes the source head after wrapping", mock.bpm_set == 140,
+      f"got {mock.bpm_set}")
+
+silence = WORKDIR / "silence.wav"
+with wave.open(str(silence), "wb") as audio:
+    audio.setparams(params)
+    audio.writeframes(bytes(len(fast)))
+mock, _ = run_case(
+    "11. Digital silence",
+    {"audio_path": str(silence), "item_length": 20, "source_length": 20},
+)
+check("silence does not offer or apply a tempo",
+      not prompt_titles(mock) and mock.bpm_set is None)
+check("silence is reported", "тишина" in mock.messages(), mock.messages())
+
 shutil.rmtree(WORKDIR.parent, ignore_errors=True)
 
 print("\n" + "=" * 70)

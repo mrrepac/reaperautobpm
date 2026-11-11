@@ -64,7 +64,8 @@ MAX_BPM = 640.0
 # Audio ------------------------------------------------------------------------
 
 
-def load_audio(path: str, offset: float = 0.0, duration: float | None = None
+def load_audio(path: str, offset: float = 0.0, duration: float | None = None,
+               wrap: bool = False
                ) -> np.ndarray:
     """Mono float32 at SR, mirroring librosa.load's soundfile path exactly.
 
@@ -73,11 +74,20 @@ def load_audio(path: str, offset: float = 0.0, duration: float | None = None
     """
     with sf.SoundFile(path) as descriptor:
         native_sr = descriptor.samplerate
-        if offset:
-            descriptor.seek(int(offset * native_sr))
+        start = int(offset * native_sr)
+        if wrap and descriptor.frames:
+            start %= descriptor.frames
+        if start:
+            descriptor.seek(start)
         frames = int(duration * native_sr) if duration is not None else -1
-        samples = descriptor.read(frames=frames, dtype="float32",
-                                  always_2d=False).T
+        if wrap and frames >= 0:
+            frames = min(frames, descriptor.frames)
+        samples = descriptor.read(frames=frames, dtype="float32", always_2d=False)
+        if wrap and frames > len(samples):
+            descriptor.seek(0)
+            head = descriptor.read(frames - len(samples), dtype="float32", always_2d=False)
+            samples = np.concatenate((samples, head))
+        samples = samples.T
 
     if samples.ndim > 1:
         samples = np.mean(samples, axis=tuple(range(samples.ndim - 1)))
@@ -171,9 +181,13 @@ def mel_spectrogram(samples: np.ndarray) -> np.ndarray:
 
 
 def read_features(path: str, offset: float = 0.0,
-                  duration: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+                  duration: float | None = None,
+                  wrap: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Returns the sliding-window network input and the raw mel spectrogram."""
-    spectrogram = mel_spectrogram(load_audio(path, offset, duration))
+    samples = load_audio(path, offset, duration, wrap)
+    if not np.any(samples):
+        raise ValueError("selected audio region is silent")
+    spectrogram = mel_spectrogram(samples)
     data = np.reshape(spectrogram, (1, spectrogram.shape[0], spectrogram.shape[1], 1))
     if data.shape[2] < WINDOW_FRAMES:
         data = _ensure_length(data, WINDOW_FRAMES)
@@ -388,8 +402,8 @@ def snap_to_loop(bpm: float, length_seconds: float | None
 
 
 def estimate(audio_path: str, offset: float = 0.0, duration: float | None = None,
-             snap_length: float | None = None) -> dict:
-    windows, spectrogram = read_features(audio_path, offset, duration)
+             snap_length: float | None = None, wrap: bool = False) -> dict:
+    windows, spectrogram = read_features(audio_path, offset, duration, wrap)
 
     session = ort.InferenceSession(str(model_path()),
                                    providers=["CPUExecutionProvider"])
@@ -512,6 +526,7 @@ def main() -> int:
             offset=_optional_float(job, "offset") or 0.0,
             duration=_optional_float(job, "duration"),
             snap_length=_optional_float(job, "snap_length"),
+            wrap=job.get("wrap") == "1",
         )
     except sf.LibsndfileError as exc:
         print(f"the engine cannot decode this file ({exc}). Formats: WAV, "
