@@ -298,6 +298,21 @@ check("silence does not offer or apply a tempo",
       not prompt_titles(mock) and mock.bpm_set is None)
 check("silence is reported", "тишина" in mock.messages(), mock.messages())
 
+# UI-only paths use a filename hint with an absent source: no engine required.
+for name, keys, expected in [
+    ("Half tempo preserves quarters", [9, 32, 9, 9, 9, 13], 56.25),
+    ("Double tempo", [9, 9, 32, 9, 9, 13], 225),
+    ("Invalid input stays editable", [48, 13, 1, 55, 48, 13], 70),
+    ("Out of range input does not apply", [57, 57, 57, 57, 13, 27], None),
+    ("Keyboard cancel button", [9, 9, 9, 13], None),
+]:
+    mock, _ = run_case(name, {
+        "audio_path": str(WORKDIR / "missing_112.5bpm.wav"),
+        "ui_keys": {i + 1: key for i, key in enumerate(keys)},
+    })
+    check(name, mock.bpm_set == expected, f"got {mock.bpm_set}")
+    check("result window closed", not mock.window_open())
+
 shutil.rmtree(WORKDIR.parent, ignore_errors=True)
 
 print("\n" + "=" * 70)

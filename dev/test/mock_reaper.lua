@@ -107,16 +107,41 @@ function reaper.RefreshToolbar2() end
 function reaper.my_getViewport() return 0, 0, 1920, 1080 end
 
 local gfx_open = false
-function gfx.init() gfx_open = true; record("gfx_init", true) end
+local confirming, prompt_recorded, answer_pos
+function gfx.init(_, w, h)
+  gfx_open = true
+  gfx.w, gfx.h = w, h
+  confirming, prompt_recorded, answer_pos = false, false, 0
+  record("gfx_init", true)
+end
 function gfx.quit() gfx_open = false; record("gfx_quit", true) end
 function gfx.getchar()
+  if confirming then
+    if config.cancel_prompt then return 27 end
+    if config.ui_keys then
+      answer_pos = answer_pos + 1
+      return config.ui_keys[answer_pos] or 27
+    end
+    local answer = config.prompt_answer or ""
+    answer_pos = answer_pos + 1
+    if answer_pos <= #answer then return answer:byte(answer_pos) end
+    return 13
+  end
   if config.cancel_after and M.ticks >= config.cancel_after then return 27 end
   return 0
 end
 function gfx.setfont() end
 function gfx.set() end
 function gfx.rect() end
-function gfx.drawstr() end
+function gfx.drawstr(text)
+  if text:find("Темп найден", 1, true) then confirming = true end
+  if confirming and gfx.y == 313 and not prompt_recorded then
+    record("prompt", text)
+    prompt_recorded = true
+  end
+end
+function gfx.measurestr(text) return #text * 7, 17 end
+gfx.mouse_cap, gfx.mouse_x, gfx.mouse_y = 0, -1, -1
 function gfx.update() end
 gfx.w, gfx.h, gfx.x, gfx.y = 460, 128, 0, 0
 

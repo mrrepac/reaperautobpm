@@ -1,5 +1,5 @@
 -- @description Detect beat BPM with TempoCNN and set project tempo
--- @version 3.0.0
+-- @version 3.1.0
 -- @author reaperplug
 -- @about
 --   Uses TempoCNN (deeptemp_k16).
@@ -35,6 +35,7 @@ local LAUNCH_CONFIRM_MS = 20000
 local EXT_SECTION = "reaperplug_engine_bpm"
 local EXT_RUNNING_KEY = "analysis_started_at"
 local EXT_CACHE_KEY = "analysis_cache"
+local EXT_REVIEW_KEY = "review_open"
 
 -- Results are kept for the session only. Keyed on path, size and region, which
 -- cannot notice a file rewritten to the same byte count -- a session-long
@@ -57,26 +58,66 @@ end
 
 -- Progress window -------------------------------------------------------------
 
-local PROGRESS_WIDTH = 460
-local PROGRESS_HEIGHT = 128
-
-local progress = { visible = false, caption = "" }
-
-local function utf8_tail(text, max_bytes)
-  if #text <= max_bytes then return text end
-  local start = #text - max_bytes + 1
-  -- Never start mid-character: continuation bytes are 0x80..0xBF.
-  while start <= #text do
-    local byte = text:byte(start)
-    if byte < 0x80 or byte >= 0xC0 then break end
-    start = start + 1
-  end
-  return "…" .. text:sub(start)
+local PROGRESS_WIDTH = 540
+local PROGRESS_HEIGHT = 440
+local progress = { visible = false, caption = "", mouse_down = false }
+local palette = {
+  bg = {0.055, 0.067, 0.082}, panel = {0.09, 0.11, 0.13},
+  edge = {0.20, 0.25, 0.28}, text = {0.92, 0.95, 0.96},
+  muted = {0.59, 0.66, 0.71}, accent = {0.36, 0.88, 0.71},
+  ink = {0.035, 0.13, 0.11}, warning = {1, 0.70, 0.38},
+}
+local function color(name)
+  local c = palette[name]
+  gfx.set(c[1], c[2], c[3], 1)
 end
-
+local function box(x, y, w, h, shade, fill)
+  color(shade)
+  gfx.rect(x, y, w, h, fill == false and 0 or 1)
+end
+local function label(text, x, y, font, shade)
+  gfx.setfont(font or 1)
+  color(shade or "text")
+  gfx.x, gfx.y = x, y
+  gfx.drawstr(text)
+end
+local function fit(text, width, font)
+  gfx.setfont(font or 1)
+  if gfx.measurestr(text) <= width then return text end
+  while #text > 0 and gfx.measurestr(text .. "…") > width do
+    text = text:gsub("[\194-\244][\128-\191]*$", ""):gsub("[%z\1-\127]$", "")
+  end
+  return text .. "…"
+end
+local function inside(x, y, w, h)
+  return gfx.mouse_x >= x and gfx.mouse_x <= x + w
+    and gfx.mouse_y >= y and gfx.mouse_y <= y + h
+end
+local function button(text, x, y, w, primary, click, focused)
+  local hover = inside(x, y, w, 40)
+  box(x, y, w, 40, primary and "accent" or (hover and "edge" or "panel"))
+  if focused then box(x, y, w, 40, "accent", false) end
+  gfx.setfont(1)
+  local tw, th = gfx.measurestr(text)
+  label(text, x + (w - tw) / 2, y + (40 - th) / 2, 1, primary and "ink" or "text")
+  return click and hover
+end
+local function input_frame()
+  local char = gfx.getchar()
+  local down = (gfx.mouse_cap & 1) == 1
+  local click = down and not progress.mouse_down
+  progress.mouse_down = down
+  return char, click
+end
+local function backdrop(subtitle)
+  box(0, 0, gfx.w, gfx.h, "bg")
+  box(28, 29, 4, 29, "accent")
+  label("TEMPO", 44, 24, 3)
+  label("LOCAL AUDIO ANALYSIS", 44, 53, 2, "muted")
+  label(subtitle, 28, 91, 1, "muted")
+  box(28, 123, gfx.w - 56, 1, "edge")
+end
 function progress.show(caption)
-  -- Four returns, not five: the viewport rect is written back into the first
-  -- four arguments and the function itself returns nothing.
   local left, top, right, bottom = reaper.my_getViewport(
     0, 0, 0, 0, 0, 0, 0, 0, true)
   local x, y = 120, 120
@@ -84,59 +125,45 @@ function progress.show(caption)
     x = math.floor((left + right - PROGRESS_WIDTH) / 2)
     y = math.floor((top + bottom - PROGRESS_HEIGHT) / 2)
   end
-
-  progress.caption = utf8_tail(caption, 52)
-  gfx.init("Detect BPM", PROGRESS_WIDTH, PROGRESS_HEIGHT, 0, x, y)
+  progress.caption = caption
+  gfx.init("Tempo — BPM Detector", PROGRESS_WIDTH, PROGRESS_HEIGHT, 0, x, y)
   gfx.setfont(1, "Segoe UI", 17)
   gfx.setfont(2, "Segoe UI", 13)
+  gfx.setfont(3, "Segoe UI", 25, 98)
+  gfx.setfont(4, "Segoe UI", 64, 98)
+  progress.mouse_down = (gfx.mouse_cap & 1) == 1
   progress.visible = true
 end
-
 function progress.close()
   if not progress.visible then return end
   gfx.quit()
+  if progress.review then
+    reaper.DeleteExtState(EXT_SECTION, EXT_REVIEW_KEY, false)
+    progress.review = false
+  end
   progress.visible = false
 end
-
--- Returns false once the user asks to stop, by Escape or by closing the window.
 function progress.update(elapsed, stage)
   if not progress.visible then return true end
-
-  local char = gfx.getchar()
+  local char, click = input_frame()
   if char < 0 or char == 27 then return false end
-
-  gfx.set(0.11, 0.11, 0.13, 1)
-  gfx.rect(0, 0, gfx.w, gfx.h, 1)
-
-  gfx.setfont(1)
-  gfx.set(0.93, 0.93, 0.95, 1)
-  gfx.x, gfx.y = 20, 22
-  gfx.drawstr(progress.caption)
-
-  -- The engine reports no intermediate progress, so the bar sweeps instead of
-  -- filling: an honest "still working", not a fabricated percentage.
-  local bar_x, bar_y = 20, 66
-  local bar_w, bar_h = gfx.w - 40, 8
-  gfx.set(0.20, 0.20, 0.23, 1)
-  gfx.rect(bar_x, bar_y, bar_w, bar_h, 1)
-
+  backdrop("Определение темпа")
+  label(stage .. "…", 28, 153, 3)
+  label(fit(progress.caption, gfx.w - 56), 28, 198, 1, "muted")
+  local bar_x, bar_y, bar_w = 28, 252, gfx.w - 56
+  box(bar_x, bar_y, bar_w, 4, "edge")
+  -- Indeterminate motion: the engine does not report a percentage.
   local knob_w = bar_w * 0.28
-  local span = bar_w + knob_w
-  local offset = (elapsed * 0.6) % 1.0 * span - knob_w
+  local offset = (elapsed * 0.6) % 1.0 * (bar_w + knob_w) - knob_w
   local from = math.max(bar_x, bar_x + offset)
   local to = math.min(bar_x + bar_w, bar_x + offset + knob_w)
-  if to > from then
-    gfx.set(0.36, 0.62, 0.93, 1)
-    gfx.rect(from, bar_y, to - from, bar_h, 1)
-  end
-
-  gfx.setfont(2)
-  gfx.set(0.60, 0.60, 0.65, 1)
-  gfx.x, gfx.y = 20, 92
-  gfx.drawstr(string.format("%s · %d с · Esc — отмена", stage, math.floor(elapsed)))
-
+  if to > from then box(from, bar_y, to - from, 4, "accent") end
+  label(string.format("Прошло %d с", math.floor(elapsed)), 28, 272, 2, "muted")
+  label("Анализ выполняется на вашем компьютере", 28, 319, 2, "muted")
+  local cancel = button("Отмена", gfx.w - 152, 364, 124, false, click)
+  label("Esc — отменить", 28, 377, 2, "muted")
   gfx.update()
-  return true
+  return not cancel
 end
 
 -- Toolbar ---------------------------------------------------------------------
@@ -774,41 +801,108 @@ end
 
 -- Confirmation ----------------------------------------------------------------
 
--- Returns a choice table, or nil plus an error message. Both nil means cancel.
-local function confirm(bpm, title)
-  local ok, value = reaper.GetUserInputs(title, 1, "BPM:,extrawidth=100",
-    format_bpm(bpm))
-  if not ok then return nil end
-
-  local typed = tonumber(((value or ""):gsub(",", ".")):match("^%s*(.-)%s*$"))
-  if not typed or typed < MIN_ACCEPTED_BPM or typed > MAX_ACCEPTED_BPM then
-    return nil, string.format(
-      "Введите BPM числом от %d до %d.", MIN_ACCEPTED_BPM, MAX_ACCEPTED_BPM
-    )
-  end
-  return { bpm = round_typed_bpm(typed) }
-end
-
+-- A deferred panel keeps REAPER usable while the result is being reviewed.
 local function confirm_and_apply(project, item, bpm, title)
   if not reaper.ValidatePtr2(project, item, "MediaItem*") then
     fail("Анализ завершён, но исходный item или проект уже закрыт.")
     return
   end
-
-  local choice, input_error = confirm(bpm, title)
-  if input_error then
-    fail(input_error)
-    return
+  progress.show("Темп найден")
+  progress.review = true
+  reaper.SetExtState(EXT_SECTION, EXT_REVIEW_KEY, "1", false)
+  local value, selected, focus = format_bpm(bpm), true, 1
+  local error_text
+  local details = title:match(" · half .- · (.*)") or title
+  if details:find("темп непостоянный", 1, true) then
+    details = "Темп непостоянный · " .. details:gsub(",? ?темп непостоянный", "")
   end
-  if not choice then return end
-
-  apply_result(project, item, choice.bpm)
+  local function valid_value()
+    local n = tonumber((value:gsub(",", ".")))
+    if n and n == n and n >= MIN_ACCEPTED_BPM and n <= MAX_ACCEPTED_BPM then
+      return round_typed_bpm(n)
+    end
+  end
+  local function submit()
+    local n = valid_value()
+    if not n then
+      error_text = "Введите число от 20 до 960 BPM"
+      focus = 1
+      return false
+    end
+    -- The item can be deleted while this nonmodal panel is open.
+    if not reaper.ValidatePtr2(project, item, "MediaItem*") then
+      progress.close()
+      fail("Исходный item или проект уже закрыт.")
+      return true
+    end
+    progress.close()
+    apply_result(project, item, n)
+    return true
+  end
+  local function scale(factor)
+    local n = valid_value()
+    if n and n * factor >= MIN_ACCEPTED_BPM and n * factor <= MAX_ACCEPTED_BPM then
+      value, selected, error_text = format_bpm(round_typed_bpm(n * factor)), true, nil
+    else
+      error_text = "Допустимый диапазон: 20–960 BPM"
+    end
+  end
+  local function frame()
+    local char, click = input_frame()
+    if char < 0 or char == 27 then progress.close(); return end
+    if char == 9 then
+      focus = (focus - 1 + ((gfx.mouse_cap & 8) ~= 0 and -1 or 1)) % 5 + 1
+    end
+    if focus == 1 then
+      if char == 1 then selected = true end
+      if char == 8 then
+        value = selected and "" or value:sub(1, -2)
+        selected, error_text = false, nil
+      elseif (char >= 48 and char <= 57) or char == 46 or char == 44 then
+        if selected then value = "" end
+        if #value < 10 then value = value .. string.char(char) end
+        selected, error_text = false, nil
+      end
+    end
+    if char == 13 or (char == 32 and focus ~= 1) then
+      if focus == 2 then scale(0.5)
+      elseif focus == 3 then scale(2)
+      elseif focus == 4 then progress.close(); return
+      elseif submit() then return end
+    end
+    backdrop("Темп найден · проверьте и примените")
+    local field_w = gfx.w - 56
+    box(28, 144, field_w, 96, "panel")
+    if focus == 1 then box(28, 144, field_w, 96, "accent", false) end
+    if click and inside(28, 144, field_w, 96) then focus, selected = 1, true end
+    gfx.setfont(4)
+    if selected and focus == 1 then box(42, 158, math.min(gfx.measurestr(value) + 14, field_w - 92), 67, "edge") end
+    label(value .. ((focus == 1 and not selected and reaper.time_precise() % 1 < 0.5) and "|" or ""), 44, 155, 4)
+    label("BPM", gfx.w - 84, 202, 1, "accent")
+    if button("÷ 2", 28, 254, 86, false, click, focus == 2) then scale(0.5); focus = 2 end
+    if button("× 2", 124, 254, 86, false, click, focus == 3) then scale(2); focus = 3 end
+    label("Исходный: " .. format_bpm(bpm) .. " BPM", 228, 265, 2, "muted")
+    label(fit(error_text or details, gfx.w - 56, 2), 28, 313, 2, error_text and "warning" or "muted")
+    label("Enter — применить · Esc — отменить", 28, 343, 2, "muted")
+    if button("Отмена", 28, 376, 124, false, click, focus == 4) then progress.close(); return end
+    if button("Применить", gfx.w - 216, 376, 188, true, click, focus == 5) then
+      if submit() then return end
+    end
+    gfx.update()
+    reaper.defer(frame)
+  end
+  reaper.defer(frame)
 end
 
 -- Entry point -----------------------------------------------------------------
 
 local function main()
   local project = reaper.EnumProjects(-1, "")
+
+  if reaper.GetExtState(EXT_SECTION, EXT_REVIEW_KEY) == "1" then
+    fail("Результат уже открыт. Примените его или закройте окно Tempo.")
+    return
+  end
 
   if analysis_in_progress() then
     fail("Анализ уже идёт. Дождитесь результата.")

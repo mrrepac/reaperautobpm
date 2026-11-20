@@ -84,3 +84,7 @@ The longer material is generated into a temp directory by
 megabytes per file. The frozen engine needs nothing installed; `--source`
 needs the build venv from `dev/model_conversion/README.md`, passed as
 `--python <path>` if it is not the interpreter running the test.
+
+The custom Tempo panel is also exercised through gfx keyboard input: half/double
+tempo (including 56.25), invalid input followed by correction, range validation,
+and keyboard cancellation. The mock records result text drawn in the panel.
